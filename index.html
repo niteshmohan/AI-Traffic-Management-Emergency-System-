@@ -380,7 +380,7 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
       <div>
         <div class="eyebrow">AI-Powered Traffic Intelligence</div>
         <h1>Junction <span id="heroJunctionName">MG&nbsp;Road &amp; 5th&nbsp;Ave</span><br>is running <span id="heroDensityWord">HIGH</span> density.</h1>
-        <p class="sub">Live computer-vision analysis of junction video, converted into vehicle counts, queue estimates and adaptive signal timing — updated in real time.</p>
+        <p class="sub">AI computer-vision analysis of uploaded junction video, converted into vehicle counts, queue estimates and adaptive green-time recommendations.</p>
       </div>
       <div class="hero-cta">
         <button class="btn" data-goto="junctions">View all junctions</button>
@@ -393,9 +393,9 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
         <div class="panel-head">
           <div>
             <div class="panel-title">Live Junction View</div>
-            <div class="panel-tag" id="heroCamTag">CAM-04 · MG ROAD ↔ 5TH AVE · SIMULATED FEED</div>
+            <div class="panel-tag" id="heroCamTag">CAM-04 · MG ROAD ↔ 5TH AVE · LATEST AI ANALYSIS</div>
           </div>
-          <div class="btn small" style="cursor:default;"><span class="dot on" style="display:inline-block;margin-right:6px;"></span>TRACKING 5 VEHICLES</div>
+          <div class="btn small" style="cursor:default;"><span class="dot on" style="display:inline-block;margin-right:6px;"></span><span id="trackingStatus">BACKEND CONNECTING</span></div>
         </div>
         <div class="junction-stage">
           <svg class="junction-svg" viewBox="0 0 400 300" id="junctionSvg">
@@ -475,7 +475,7 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
   <section style="padding-top:40px;">
     <div class="eyebrow">Analyze a Traffic Video</div>
     <h1 style="font-size:32px;">Upload footage for AI analysis.</h1>
-    <p class="sub">Drop a junction video below. Frames are sent through detection, tracking and traffic analytics, then a signal recommendation is generated automatically.</p>
+    <p class="sub">Upload a junction video. The FastAPI backend runs YOLO detection/tracking, computes traffic intelligence, and returns a signal recommendation.</p>
   </section>
 
   <section style="padding-top:0;">
@@ -626,736 +626,416 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
 
 
 <script>
-  // TRAFIQ backend connection. Change this when deploying the FastAPI server.
-  window.TRAFIQ_API_BASE = window.TRAFIQ_API_BASE || (
-    window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-      ? 'http://127.0.0.1:8000'
-      : 'http://127.0.0.1:8000'
-  );
-  window.TRAFIQ_BACKEND_MODE = true;
-</script>
+/* ================================================================
+   TRAFIQ REAL BACKEND INTEGRATION
+   Backend: FastAPI + SQLite + Ultralytics YOLO
+   API: /api/health, /api/dashboard, /api/junctions,
+        /api/analyze, /api/jobs/{id}, /api/analyses, /api/settings
+   ================================================================ */
 
-<script>
+// Change this ONE line after deploying the backend to Render/Railway.
+window.TRAFIQ_API_BASE = window.TRAFIQ_API_BASE || 'http://127.0.0.1:8000';
+const API_BASE = window.TRAFIQ_API_BASE.replace(/\/$/, '');
+
+let selectedJunctionId = 'CAM-04';
+let junctions = [];
+let searchTerm = '';
+let unitSystem = localStorage.getItem('trafiq_units') || 'metric';
+let settings = {
+  high_density_alerts: true,
+  emergency_priority: true,
+  camera_health_alerts: true,
+  weekly_analytics_email: false,
+  high_density_threshold: 50,
+};
+let currentFileName = '';
+let currentObjectUrl = null;
+let currentDuration = 0;
+let analysisPollTimer = null;
+let alerts = [];
+
+const $ = (id) => document.getElementById(id);
+
+function apiUrl(path){ return API_BASE + path; }
+
+async function api(path, options = {}) {
+  const response = await fetch(apiUrl(path), options);
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) {
+    const message = data?.detail || data?.message || `API error ${response.status}`;
+    throw new Error(message);
+  }
+  return data;
+}
+
+function showToast(msg, error=false){
+  let el = $('toastEl');
+  if(!el){
+    el = document.createElement('div');
+    el.id='toastEl';
+    el.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--text);color:#fff;font-family:var(--body);font-size:13px;font-weight:600;padding:11px 20px;border-radius:10px;box-shadow:var(--shadow);z-index:9999;opacity:0;transition:opacity .25s;max-width:min(90vw,560px);text-align:center;';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.background = error ? 'var(--red)' : 'var(--text)';
+  el.style.opacity='1';
+  clearTimeout(window.toastTimer);
+  window.toastTimer=setTimeout(()=>el.style.opacity='0',2800);
+}
+
 /* ---------------- navigation ---------------- */
 function showView(name){
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
-  document.getElementById('view-'+name).classList.add('active');
+  const view = $('view-'+name);
+  if(view) view.classList.add('active');
   document.querySelectorAll('.navtab').forEach(t=>t.classList.toggle('active', t.dataset.view===name));
   window.scrollTo({top:0, behavior:'smooth'});
+  if(name==='junctions') renderJunctions();
+  if(name==='settings') loadSettings();
+  if(name==='upload') loadRecentAnalyses();
 }
-document.querySelectorAll('.navtab').forEach(t=> t.addEventListener('click', ()=> showView(t.dataset.view)) );
-document.querySelectorAll('[data-goto]').forEach(el=> el.addEventListener('click', ()=> showView(el.dataset.goto)) );
+document.querySelectorAll('.navtab').forEach(t=>t.addEventListener('click',()=>showView(t.dataset.view)));
+document.querySelectorAll('[data-goto]').forEach(el=>el.addEventListener('click',()=>showView(el.dataset.goto)));
 
 /* ---------------- dropdowns ---------------- */
 function toggleDropdown(btnId, ddId, otherId){
-  document.getElementById(btnId).addEventListener('click', (e)=>{
+  $(btnId).addEventListener('click',(e)=>{
     e.stopPropagation();
-    document.getElementById(otherId).classList.remove('show');
-    document.getElementById(ddId).classList.toggle('show');
+    $(otherId).classList.remove('show');
+    $(ddId).classList.toggle('show');
   });
 }
 toggleDropdown('notifBtn','notifDropdown','userDropdown');
 toggleDropdown('avatarBtn','userDropdown','notifDropdown');
-document.addEventListener('click', ()=>{
-  document.getElementById('notifDropdown').classList.remove('show');
-  document.getElementById('userDropdown').classList.remove('show');
+document.addEventListener('click',()=>{
+  $('notifDropdown').classList.remove('show');
+  $('userDropdown').classList.remove('show');
 });
 
-/* ---------------- alerts (dynamic notifications) ---------------- */
-let alerts = [
-  {text:'HIGH density — MG Road & 5th Ave', level:'red', time:'2 min ago'},
-  {text:'Ambulance priority signal issued — East arm', level:'amber', time:'6 min ago'},
-  {text:'Redis pub/sub latency degraded', level:'amber', time:'14 min ago'},
-  {text:'Ring Road North camera reconnected', level:'green', time:'21 min ago'},
-];
-let unreadAlerts = 0;
-function pushAlert(text, level){
+/* ---------------- alerts ---------------- */
+function pushAlert(text, level='amber'){
   alerts.unshift({text, level, time:'just now'});
-  alerts = alerts.slice(0, 8);
-  unreadAlerts++;
+  alerts=alerts.slice(0,8);
   renderAlerts();
 }
 function renderAlerts(){
-  document.getElementById('alertsList').innerHTML = alerts.map(a=>
-    `<div class="dropdown-item"><span class="di-dot" style="background:var(--${a.level})"></span><div><div class="di-t">${a.text}</div><div class="di-s">${a.time}</div></div></div>`
-  ).join('');
-  document.querySelector('.badge-dot').style.display = unreadAlerts>0 ? 'block' : 'none';
+  $('alertsList').innerHTML = alerts.length ? alerts.map(a=>
+    `<div class="dropdown-item"><span class="di-dot" style="background:var(--${a.level})"></span><div><div class="di-t">${escapeHtml(a.text)}</div><div class="di-s">${escapeHtml(a.time)}</div></div></div>`
+  ).join('') : '<div class="dropdown-item"><div class="di-s">No active alerts.</div></div>';
 }
-renderAlerts();
-document.getElementById('notifBtn').addEventListener('click', ()=>{ unreadAlerts=0; document.querySelector('.badge-dot').style.display='none'; });
+$('notifBtn').addEventListener('click',()=>document.querySelector('.badge-dot').style.display='none');
 
 /* ---------------- profile ---------------- */
-document.getElementById('accountSettingsLink').addEventListener('click', ()=> showView('settings'));
-document.getElementById('signOutLink').addEventListener('click', ()=>{
-  document.getElementById('userDropdown').classList.remove('show');
-  showToast('Signed out (demo — no auth backend connected)');
+$('accountSettingsLink').addEventListener('click',()=>showView('settings'));
+$('signOutLink').addEventListener('click',()=>{
+  $('userDropdown').classList.remove('show');
+  showToast('Demo sign-out only — authentication is not connected yet.');
 });
-function editProfile(){
-  const name = prompt('Display name', document.getElementById('userNameLabel').textContent);
-  if(!name) return;
-  const initials = name.trim().split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
-  document.getElementById('userNameLabel').textContent = name;
-  document.getElementById('avatarBtn').textContent = initials || 'SO';
-  document.getElementById('profileNameSetting').textContent = name;
-  showToast('Profile updated');
-}
-document.getElementById('editProfileBtn').addEventListener('click', editProfile);
-
-/* ---------------- toast ---------------- */
-let toastTimer;
-function showToast(msg){
-  let el = document.getElementById('toastEl');
-  if(!el){
-    el = document.createElement('div');
-    el.id='toastEl';
-    el.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--text);color:#fff;font-family:var(--body);font-size:13px;font-weight:600;padding:11px 20px;border-radius:10px;box-shadow:var(--shadow);z-index:999;opacity:0;transition:opacity .25s;';
-    document.body.appendChild(el);
-  }
-  el.textContent = msg;
-  el.style.opacity='1';
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(()=> el.style.opacity='0', 2200);
-}
+$('editProfileBtn').addEventListener('click',()=>{
+  const name=prompt('Display name',$('userNameLabel').textContent);
+  if(!name?.trim()) return;
+  const clean=name.trim();
+  const initials=clean.split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  $('userNameLabel').textContent=clean;
+  $('avatarBtn').textContent=initials||'SO';
+  $('profileNameSetting').textContent=clean;
+  showToast('Profile updated locally.');
+});
 
 /* ---------------- search ---------------- */
-let searchTerm = '';
-document.getElementById('searchInput').addEventListener('input', (e)=>{
-  searchTerm = e.target.value.trim().toLowerCase();
-  if(searchTerm) showView('junctions');
+$('searchInput').addEventListener('input',(e)=>{
+  searchTerm=e.target.value.trim().toLowerCase();
+  showView('junctions');
   renderJunctions();
 });
 
 /* ---------------- clock ---------------- */
-function tickClock(){
-  const s = new Date().toLocaleTimeString('en-GB');
-  document.getElementById('footClock').textContent = 'Last sync ' + s;
-}
+function tickClock(){ $('footClock').textContent='Last sync '+new Date().toLocaleTimeString('en-GB'); }
 setInterval(tickClock,1000); tickClock();
 
-/* ---------------- junction ambient vehicle dots ---------------- */
-const vGroup = document.getElementById('vehicles');
-const lanesDef = [
-  {axis:'v', x:190, y0:-10, y1:145},
-  {axis:'v', x:210, y0:310, y1:158},
-  {axis:'h', y:140, x0:-10, x1:175},
-  {axis:'h', y:160, x0:410, x1:228},
-];
-let dots = [];
-function spawnDot(){
-  const lane = lanesDef[Math.floor(Math.random()*lanesDef.length)];
-  const el = document.createElementNS('http://www.w3.org/2000/svg','rect');
-  el.setAttribute('width', lane.axis==='v'?6:11);
-  el.setAttribute('height', lane.axis==='v'?11:6);
-  el.setAttribute('rx',2);
-  el.setAttribute('fill', Math.random()>0.82 ? '#C2790C' : '#0891A8');
-  vGroup.appendChild(el);
-  dots.push({el, lane, t:0});
-}
-function stepDots(){
-  dots.forEach(d=>{
-    d.t += 0.012 + Math.random()*0.004;
-    if(d.lane.axis==='v'){
-      d.el.setAttribute('x', d.lane.x);
-      d.el.setAttribute('y', d.lane.y0 + (d.lane.y1-d.lane.y0)*Math.min(d.t,1));
-    } else {
-      d.el.setAttribute('x', d.lane.x0 + (d.lane.x1-d.lane.x0)*Math.min(d.t,1));
-      d.el.setAttribute('y', d.lane.y);
-    }
-  });
-  dots = dots.filter(d=>{ if(d.t>=1){d.el.remove(); return false;} return true; });
-  requestAnimationFrame(stepDots);
-}
-setInterval(()=>{ if(dots.length<14) spawnDot(); }, 380);
-requestAnimationFrame(stepDots);
-
-/* ---------------- signal phase cycle ---------------- */
-const phases = [
-  {name:'N–S GREEN', color:'#0E8F60', dur:42},
-  {name:'N–S YELLOW', color:'#C2790C', dur:4},
-  {name:'E–W GREEN', color:'#0891A8', dur:36},
-  {name:'E–W YELLOW', color:'#C2790C', dur:4},
-];
-let phaseIdx=0, phaseRemain=phases[0].dur;
-const CIRC = 106.8;
-function renderPhase(){
-  const p = phases[phaseIdx];
-  document.getElementById('phaseVal').textContent = p.name;
-  document.getElementById('countdownVal').textContent = phaseRemain+'s';
-  document.getElementById('sigLight').setAttribute('fill', p.color);
-  const ring = document.getElementById('sigRing');
-  ring.setAttribute('stroke', p.color);
-  ring.setAttribute('stroke-dashoffset', CIRC*(1-phaseRemain/p.dur));
-}
-setInterval(()=>{
-  phaseRemain--;
-  if(phaseRemain<=0){ phaseIdx=(phaseIdx+1)%phases.length; phaseRemain=phases[phaseIdx].dur; }
-  renderPhase();
-},1000);
-renderPhase();
-
 /* ---------------- units ---------------- */
-let unitSystem = 'metric';
-function fmtDist(m){ return unitSystem==='metric' ? m+'m' : Math.round(m*3.281)+'ft'; }
-function fmtSpeed(kmh){ return unitSystem==='metric' ? kmh : Math.round(kmh*0.621); }
-document.getElementById('unitsBtn').addEventListener('click', ()=>{
-  unitSystem = unitSystem==='metric' ? 'imperial' : 'metric';
-  document.getElementById('unitsBtn').textContent = unitSystem==='metric' ? 'Metric (km/h, m)' : 'Imperial (mph, ft)';
-  document.getElementById('avgSpeedLabel').textContent = unitSystem==='metric' ? 'Avg Speed km/h' : 'Avg Speed mph';
-  showToast('Units switched to '+(unitSystem==='metric'?'metric':'imperial'));
-});
-
-/* ---------------- simulated metrics ---------------- */
-let counts = {car:35, bike:12, bus:3, truck:4};
-let history = [];
-for(let i=0;i<15;i++) history.push(40+Math.round(Math.random()*30));
-let HIGH_THRESHOLD = 50;
-function densityFromTotal(t){ if(t>HIGH_THRESHOLD) return 'HIGH'; if(t>HIGH_THRESHOLD-22) return 'MEDIUM'; return 'LOW'; }
-function recGreenFromDensity(d){ if(d==='HIGH') return 70+Math.round(Math.random()*20); if(d==='MEDIUM') return 42+Math.round(Math.random()*14); return 20+Math.round(Math.random()*10); }
-
-const volCtx = document.getElementById('volumeChart').getContext('2d');
-const volumeChart = new Chart(volCtx, {
-  type:'line',
-  data:{ labels: history.map((_,i)=>(15-i)+'m'), datasets:[{
-    label:'Vehicles / min', data:history, borderColor:'#0891A8',
-    backgroundColor:(ctx)=>{ const g=ctx.chart.ctx.createLinearGradient(0,0,0,220); g.addColorStop(0,'rgba(8,145,168,0.18)'); g.addColorStop(1,'rgba(8,145,168,0)'); return g; },
-    fill:true, tension:0.35, pointRadius:0, borderWidth:2.2,
-  }]},
-  options:{ responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
-    scales:{ x:{ticks:{color:'#9AA2B4', font:{family:'JetBrains Mono', size:10}}, grid:{color:'#EDF0F5'}},
-             y:{ticks:{color:'#9AA2B4', font:{family:'JetBrains Mono', size:10}}, grid:{color:'#EDF0F5'}, beginAtZero:true} } }
-});
-
-const mixCtx = document.getElementById('mixChart').getContext('2d');
-const mixColors = ['#0891A8','#C2790C','#0E8F60','#D6393F'];
-const mixChart = new Chart(mixCtx, {
-  type:'doughnut',
-  data:{ labels:['Cars','Motorcycles','Buses','Trucks'], datasets:[{ data:[counts.car,counts.bike,counts.bus,counts.truck], backgroundColor:mixColors, borderWidth:0, hoverOffset:4 }] },
-  options:{ responsive:true, maintainAspectRatio:false, cutout:'68%', plugins:{legend:{display:false}} }
-});
-function renderMixLegend(){
-  const labels=['Cars','Motorcycles','Buses','Trucks']; const vals=[counts.car,counts.bike,counts.bus,counts.truck];
-  document.getElementById('mixLegend').innerHTML = labels.map((l,i)=>`<div class="legend-item"><span class="legend-swatch" style="background:${mixColors[i]}"></span>${l} · ${vals[i]}</div>`).join('');
+function fmtDist(m){
+  const n=Number(m||0);
+  return unitSystem==='metric' ? `${Math.round(n)}m` : `${Math.round(n*3.281)}ft`;
 }
-renderMixLegend();
+function fmtSpeed(kmh){
+  const n=Number(kmh||0);
+  return unitSystem==='metric' ? Math.round(n) : Math.round(n*0.621371);
+}
+$('unitsBtn').addEventListener('click',()=>{
+  unitSystem=unitSystem==='metric'?'imperial':'metric';
+  localStorage.setItem('trafiq_units',unitSystem);
+  applyUnits();
+  showToast('Units switched to '+unitSystem+'.');
+});
+function applyUnits(){
+  $('unitsBtn').textContent=unitSystem==='metric'?'Metric (km/h, m)':'Imperial (mph, ft)';
+  $('avgSpeedLabel').textContent=unitSystem==='metric'?'Avg Speed km/h':'Avg Speed mph';
+}
+applyUnits();
 
-function jitter(v,min,max,amt){ return Math.max(min, Math.min(max, v + Math.round((Math.random()-0.45)*amt))); }
+/* ---------------- dashboard ---------------- */
+let volumeChart=null;
+let mixChart=null;
+function initCharts(){
+  const volCtx=$('volumeChart').getContext('2d');
+  volumeChart=new Chart(volCtx,{type:'line',data:{labels:[],datasets:[{label:'Vehicles / analysis',data:[],borderColor:'#0891A8',backgroundColor:'rgba(8,145,168,0.12)',fill:true,tension:.35,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#9AA2B4',font:{family:'JetBrains Mono',size:10}},grid:{color:'#EDF0F5'}},y:{ticks:{color:'#9AA2B4',font:{family:'JetBrains Mono',size:10}},grid:{color:'#EDF0F5'},beginAtZero:true}}}});
+  const mixCtx=$('mixChart').getContext('2d');
+  mixChart=new Chart(mixCtx,{type:'doughnut',data:{labels:['Cars','Motorcycles','Buses','Trucks'],datasets:[{data:[0,0,0,0],backgroundColor:['#0891A8','#C2790C','#0E8F60','#D6393F'],borderWidth:0,hoverOffset:4}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%',plugins:{legend:{display:false}}}});
+}
+function renderMixLegend(counts){
+  const labels=['Cars','Motorcycles','Buses','Trucks'];
+  const vals=[counts.car||0,counts.motorcycle||0,counts.bus||0,counts.truck||0];
+  const colors=['#0891A8','#C2790C','#0E8F60','#D6393F'];
+  $('mixLegend').innerHTML=labels.map((l,i)=>`<div class="legend-item"><span class="legend-swatch" style="background:${colors[i]}"></span>${l} · ${vals[i]}</div>`).join('');
+}
+function renderDashboard(data){
+  const counts=data.counts||{car:0,motorcycle:0,bus:0,truck:0};
+  const total=Number(data.total_vehicles||0);
+  const density=data.density||'LOW';
+  $('totVeh').textContent=total;
+  $('queueLen').textContent=fmtDist(data.queue_length_m);
+  $('avgSpeed').textContent=fmtSpeed(data.avg_speed_kmh);
+  $('waitTime').textContent=Math.round(data.avg_wait_seconds||0)+'s';
+  $('recTime').textContent=data.recommended_green_seconds??20;
+  $('queueVal').textContent=fmtDist(data.queue_length_m);
+  $('mCars').textContent=counts.car||0;
+  $('mBikes').textContent=counts.motorcycle||0;
+  $('mBuses').textContent=counts.bus||0;
+  $('mTrucks').textContent=counts.truck||0;
+  $('heroDensityWord').textContent=density;
+  const badge=$('densityBadge');
+  badge.className='density-badge '+density;
+  badge.textContent='● '+density+' DENSITY';
+  $('trackingStatus').textContent=data.last_analysis ? `AI ANALYSIS · ${total} VEHICLES` : 'NO ANALYSIS YET';
+  if(data.last_analysis) $('heroCamTag').textContent=`${selectedJunctionId} · ${$('heroJunctionName').textContent.replace(/\u00a0/g,' ')} · LATEST AI ANALYSIS`;
 
-function updateMetrics(){
-  if(window.TRAFIQ_BACKEND_MODE) return;
-  const prev = {...counts};
-  counts.car = jitter(counts.car,10,60,6);
-  counts.bike = jitter(counts.bike,2,25,4);
-  counts.bus = jitter(counts.bus,0,8,2);
-  counts.truck = jitter(counts.truck,0,10,2);
-  const total = counts.car+counts.bike+counts.bus+counts.truck;
-  const dens = densityFromTotal(total);
-  const rec = recGreenFromDensity(dens);
-  const queue = Math.round(total*1.1 + Math.random()*8);
-  const avgSpeed = dens==='HIGH'? 8+Math.round(Math.random()*8) : dens==='MEDIUM'? 18+Math.round(Math.random()*8) : 30+Math.round(Math.random()*10);
-  const waitTime = dens==='HIGH'? 70+Math.round(Math.random()*40) : dens==='MEDIUM'? 30+Math.round(Math.random()*20) : 8+Math.round(Math.random()*12);
-
-  document.getElementById('mCars').textContent = counts.car;
-  document.getElementById('mBikes').textContent = counts.bike;
-  document.getElementById('mBuses').textContent = counts.bus;
-  document.getElementById('mTrucks').textContent = counts.truck;
-  setDelta('dCars', counts.car-prev.car); setDelta('dBikes', counts.bike-prev.bike);
-  setDelta('dBuses', counts.bus-prev.bus); setDelta('dTrucks', counts.truck-prev.truck);
-
-  document.getElementById('totVeh').textContent = total;
-  document.getElementById('queueLen').textContent = fmtDist(queue);
-  document.getElementById('avgSpeed').textContent = fmtSpeed(avgSpeed);
-  document.getElementById('waitTime').textContent = waitTime+'s';
-  document.getElementById('recTime').textContent = rec;
-  document.getElementById('queueVal').textContent = fmtDist(queue);
-
-  const badge = document.getElementById('densityBadge');
-  badge.className = 'density-badge '+dens; badge.innerHTML = '● '+dens+' DENSITY';
-  document.getElementById('heroDensityWord').textContent = dens;
-
-  if(dens==='HIGH' && prevDens!=='HIGH' && document.getElementById('toggleHighDensity').classList.contains('on')){
-    pushAlert('HIGH density — '+document.getElementById('heroJunctionName').textContent.replace(/&nbsp;/g,' '), 'red');
+  if(data.history?.length){
+    volumeChart.data.labels=data.history.map((_,i)=>`#${i+1}`);
+    volumeChart.data.datasets[0].data=data.history;
+    volumeChart.update('none');
+  } else {
+    volumeChart.data.labels=[]; volumeChart.data.datasets[0].data=[]; volumeChart.update('none');
   }
-  prevDens = dens;
+  mixChart.data.datasets[0].data=[counts.car||0,counts.motorcycle||0,counts.bus||0,counts.truck||0];
+  mixChart.update('none');
+  renderMixLegend(counts);
 
-  const qFrac = Math.min(queue/70,1);
-  document.getElementById('qNorth').setAttribute('height', 90*qFrac);
-  document.getElementById('qNorth').setAttribute('y', 10+(90-90*qFrac));
-  document.getElementById('qSouth').setAttribute('height', 90*qFrac);
-  document.getElementById('qSouth').setAttribute('y', 200);
-  document.getElementById('qWest').setAttribute('width', 130*qFrac);
-  document.getElementById('qEast').setAttribute('width', 130*qFrac);
-  document.getElementById('qEast').setAttribute('x', 390-130*qFrac);
-
-  mixChart.data.datasets[0].data = [counts.car,counts.bike,counts.bus,counts.truck]; mixChart.update('none');
-  renderMixLegend();
-
-  history.push(total); history.shift();
-  volumeChart.data.labels = history.map((_,i)=>(15-i)+'m');
-  volumeChart.data.datasets[0].data = history; volumeChart.update('none');
-
-  const banner = document.getElementById('emgBanner');
-  if(Math.random() < 0.12 && document.getElementById('toggleEmergency').classList.contains('on')){
-    const arms=['North','South','East','West'];
-    const arm = arms[Math.floor(Math.random()*4)];
-    document.getElementById('emgText').textContent = 'Ambulance detected — '+arm+' approach. Priority green recommended.';
-    banner.classList.add('show'); setTimeout(()=>banner.classList.remove('show'), 6000);
-    pushAlert('Ambulance priority signal issued — '+arm+' arm', 'amber');
+  const emg=data.emergency||{};
+  const banner=$('emgBanner');
+  if(emg.detected){
+    $('emgText').textContent=`${emg.type||'Emergency vehicle'} detected — ${emg.arm||'approach'}. Priority green recommended.`;
+    banner.classList.add('show');
+  } else banner.classList.remove('show');
+}
+async function loadDashboard(){
+  try{
+    const data=await api('/api/dashboard?junction_id='+encodeURIComponent(selectedJunctionId));
+    renderDashboard(data);
+    $('trackingStatus').title='Connected to FastAPI backend';
+  }catch(err){
+    $('trackingStatus').textContent='BACKEND OFFLINE';
+    $('trackingStatus').style.color='var(--red)';
+    showToast('Backend unavailable: '+err.message,false);
   }
 }
-let prevDens = 'HIGH';
-function setDelta(id, diff){
-  const el = document.getElementById(id);
-  if(diff>0){ el.textContent='↑ '+diff+' vs last min'; el.className='mcard-delta up'; }
-  else if(diff<0){ el.textContent='↓ '+Math.abs(diff)+' vs last min'; el.className='mcard-delta down'; }
-  else { el.textContent='→ steady'; el.className='mcard-delta'; }
-}
-if(!window.TRAFIQ_BACKEND_MODE) setInterval(updateMetrics, 4000);
 
-/* ---------------- junction table ---------------- */
-const junctions = [
-  {name:'MG Road & 5th Ave', id:'CAM-04'},
-  {name:'Station Road Circle', id:'CAM-01'},
-  {name:'College Junction', id:'CAM-02'},
-  {name:'Ring Road North', id:'CAM-03'},
-  {name:'Market Square', id:'CAM-05'},
-];
+/* ---------------- junctions ---------------- */
 function selectJunction(j){
-  document.getElementById('heroJunctionName').innerHTML = j.name.replace(/&/g,'&amp;').replace(/ /g,'&nbsp;');
-  document.getElementById('heroCamTag').textContent = j.id+' · '+j.name.toUpperCase()+' · SIMULATED FEED';
+  selectedJunctionId=j.id;
+  $('heroJunctionName').innerHTML=escapeHtml(j.name).replace(/ /g,'&nbsp;');
+  $('heroCamTag').textContent=j.id+' · '+j.name.toUpperCase()+' · LATEST AI ANALYSIS';
   showView('dashboard');
+  loadDashboard();
 }
-document.getElementById('addJunctionBtn').addEventListener('click', ()=>{
-  const name = prompt('New junction name');
-  if(!name) return;
-  const num = String(junctions.length+1).padStart(2,'0');
-  junctions.push({name, id:'CAM-'+num});
-  renderJunctions();
-  showToast('Junction added: '+name);
-});
+async function loadJunctions(){
+  try{
+    junctions=await api('/api/junctions');
+    renderJunctions();
+    const selected=junctions.find(j=>j.id===selectedJunctionId)||junctions[0];
+    if(selected){ selectedJunctionId=selected.id; $('heroJunctionName').innerHTML=escapeHtml(selected.name).replace(/ /g,'&nbsp;'); }
+  }catch(err){
+    $('junctionRows').innerHTML=`<tr><td colspan="6" style="color:var(--red);font-family:var(--mono);font-size:12px;">Cannot load junctions: ${escapeHtml(err.message)}</td></tr>`;
+  }
+}
 function renderJunctions(){
-  if(window.TRAFIQ_BACKEND_MODE) return;
-  const filtered = searchTerm ? junctions.filter(j=> j.name.toLowerCase().includes(searchTerm) || j.id.toLowerCase().includes(searchTerm)) : junctions;
-  document.getElementById('junctionCountTag').textContent = filtered.length+' OF '+junctions.length+' CONNECTED';
-  if(filtered.length===0){
-    document.getElementById('junctionRows').innerHTML = `<tr><td colspan="6" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No junctions match "${searchTerm}".</td></tr>`;
+  const filtered=searchTerm?junctions.filter(j=>j.name.toLowerCase().includes(searchTerm)||j.id.toLowerCase().includes(searchTerm)):junctions;
+  $('junctionCountTag').textContent=filtered.length+' OF '+junctions.length+' CONNECTED';
+  if(!filtered.length){
+    $('junctionRows').innerHTML='<tr><td colspan="6" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No junctions found.</td></tr>';
     return;
   }
-  const rows = filtered.map(j=>{
-    const total = 18+Math.round(Math.random()*50);
-    const dens = densityFromTotal(total);
-    const rec = recGreenFromDensity(dens);
-    const queue = Math.round(total*0.9+Math.random()*10);
-    const online = Math.random()>0.06;
-    if(!online && document.getElementById('toggleCameraHealth').classList.contains('on') && Math.random()<0.3){
-      pushAlert(j.name+' camera reconnecting', 'amber');
-    }
-    return `<tr style="cursor:pointer;" data-jname="${j.name.replace(/"/g,'&quot;')}" data-jid="${j.id}">
-      <td><div class="jname">${j.name}</div><div class="panel-tag">${j.id}</div></td>
-      <td><span class="jstatus"><span class="dot ${online?'on':'warn'}"></span>${online?'Online':'Reconnecting'}</span></td>
-      <td class="jnum">${total}</td>
-      <td><span class="densechip ${dens}">${dens}</span></td>
-      <td class="jnum">${fmtDist(queue)}</td>
-      <td class="jnum">${rec}s</td>
+  $('junctionRows').innerHTML=filtered.map(j=>{
+    const latest=j.latest;
+    const total=latest?.total_vehicles??0;
+    const dens=latest?.density||'LOW';
+    return `<tr style="cursor:pointer" data-id="${escapeHtml(j.id)}">
+      <td><div class="jname">${escapeHtml(j.name)}</div><div class="panel-tag">${escapeHtml(j.id)}</div></td>
+      <td><span class="jstatus"><span class="dot ${j.online?'on':'off'}"></span>${j.online?'Online':'Offline'}</span></td>
+      <td class="jnum">${total}</td><td><span class="densechip ${dens}">${dens}</span></td>
+      <td class="jnum">${fmtDist(latest?.queue_length_m||0)}</td>
+      <td class="jnum">${latest?.recommended_green_seconds??20}s</td>
     </tr>`;
   }).join('');
-  document.getElementById('junctionRows').innerHTML = rows;
-  document.querySelectorAll('#junctionRows tr[data-jname]').forEach(tr=>{
-    tr.addEventListener('click', ()=> selectJunction({name:tr.dataset.jname, id:tr.dataset.jid}));
-  });
+  document.querySelectorAll('#junctionRows tr[data-id]').forEach(tr=>tr.addEventListener('click',()=>{
+    const j=junctions.find(x=>x.id===tr.dataset.id); if(j) selectJunction(j);
+  }));
 }
-renderJunctions(); if(!window.TRAFIQ_BACKEND_MODE) setInterval(renderJunctions, 5000);
-
-/* ---------------- upload & analyze ---------------- */
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const fileRowHolder = document.getElementById('fileRowHolder');
-const progressWrap = document.getElementById('progressWrap');
-const progressFill = document.getElementById('progressFill');
-const progressPct = document.getElementById('progressPct');
-const progressStageLabel = document.getElementById('progressStageLabel');
-const stageList = document.getElementById('stageList');
-const resultCard = document.getElementById('resultCard');
-
-const stages = [
-  {label:'Uploading video', pct:20},
-  {label:'Extracting frames', pct:40},
-  {label:'Running YOLO detection', pct:62},
-  {label:'Tracking vehicles across frames', pct:80},
-  {label:'Computing density & queue length', pct:92},
-  {label:'Generating signal recommendation', pct:100},
-];
-
-function fmtBytes(b){
-  if(b < 1024) return b+' B';
-  if(b < 1024*1024) return (b/1024).toFixed(1)+' KB';
-  return (b/(1024*1024)).toFixed(1)+' MB';
-}
-function fmtDuration(s){
-  if(!isFinite(s)) return '—';
-  const m = Math.floor(s/60), r = Math.round(s%60);
-  return m+':'+String(r).padStart(2,'0');
-}
-
-let currentObjectUrl = null;
-let currentFileName = '';
-let currentDuration = 0;
-
-function clearUpload(){
-  fileRowHolder.innerHTML='';
-  progressWrap.classList.remove('show');
-  resultCard.classList.remove('show');
-  fileInput.value='';
-  if(currentObjectUrl){ URL.revokeObjectURL(currentObjectUrl); currentObjectUrl=null; }
-}
-
-function handleFile(file){
-  if(!file) return;
-  resultCard.classList.remove('show');
-  if(currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
-  currentObjectUrl = URL.createObjectURL(file);
-  currentFileName = file.name;
-  currentDuration = 0;
-
-  fileRowHolder.innerHTML = `
-    <div class="file-row">
-      <div class="file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="15" height="16" rx="2"/><path d="M22 8l-5 3.5L22 15V8z"/></svg></div>
-      <div class="file-meta"><div class="file-name">${file.name}</div><div class="file-size" id="fileSizeLine">${fmtBytes(file.size)} · ${file.type || 'video'}</div></div>
-      <div class="file-remove" id="fileRemoveBtn">✕</div>
-    </div>
-    <video id="videoPreview" src="${currentObjectUrl}" controls muted style="width:100%;border-radius:12px;margin-top:12px;background:#000;max-height:260px;"></video>`;
-
-  const vid = document.getElementById('videoPreview');
-  vid.addEventListener('loadedmetadata', ()=>{
-    currentDuration = vid.duration || 0;
-    document.getElementById('fileSizeLine').textContent = `${fmtBytes(file.size)} · ${file.type || 'video'} · ${fmtDuration(currentDuration)}`;
-  });
-
-  document.getElementById('fileRemoveBtn').addEventListener('click', clearUpload);
-  runAnalysis();
-}
-
-
-let analysisJobId = null;
-let analysisPollTimer = null;
-
-async function runAnalysis(){
-  if(!currentFileName) return;
-  progressWrap.classList.add('show');
-  resultCard.classList.remove('show');
-  stageList.innerHTML = stages.map((s,i)=>`<div class="stage-item" data-i="${i}"><div class="si-dot"></div><span>${s.label}</span></div>`).join('');
-  progressStageLabel.textContent = 'Uploading video…';
-  progressPct.textContent = '5%';
-  progressFill.style.width = '5%';
-
-  const file = fileInput.files[0];
-  if(!file){
-    showToast('Please select a video first');
-    return;
-  }
-
+$('addJunctionBtn').addEventListener('click',async()=>{
+  const name=prompt('New junction name');
+  if(!name?.trim()) return;
   try{
-    const form = new FormData();
-    form.append('file', file);
-    form.append('junction_id', window.TRAFIQ_SELECTED_JUNCTION_ID || 'CAM-04');
-
-    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/analyze`, {
-      method:'POST', body:form
-    });
-    if(!res.ok) throw new Error(await res.text());
-    const job = await res.json();
-    analysisJobId = job.job_id;
-    pollAnalysisJob();
-  }catch(err){
-    console.error(err);
-    progressStageLabel.textContent = 'Backend connection failed';
-    progressPct.textContent = '0%';
-    showToast('Could not connect to TRAFIQ backend');
-  }
-}
-
-async function pollAnalysisJob(){
-  if(!analysisJobId) return;
-  try{
-    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/jobs/${analysisJobId}`);
-    if(!res.ok) throw new Error(await res.text());
-    const job = await res.json();
-    const pct = Number(job.progress || 0);
-    progressPct.textContent = pct + '%';
-    progressFill.style.width = pct + '%';
-    progressStageLabel.textContent = job.message || job.status;
-
-    const active = Math.min(stages.length-1, Math.floor(pct/100*stages.length));
-    document.querySelectorAll('.stage-item').forEach((el,i)=>{
-      el.classList.toggle('done', i < active || job.status === 'completed');
-      el.classList.toggle('active', i === active && job.status !== 'completed' && job.status !== 'failed');
-    });
-
-    if(job.status === 'completed'){
-      if(analysisPollTimer) clearTimeout(analysisPollTimer);
-      showBackendResults(job.result);
-      loadRecentAnalyses();
-      await refreshDashboard();
-      return;
-    }
-    if(job.status === 'failed'){
-      if(analysisPollTimer) clearTimeout(analysisPollTimer);
-      progressStageLabel.textContent = 'Analysis failed';
-      showToast(job.error || 'Analysis failed');
-      return;
-    }
-    analysisPollTimer = setTimeout(pollAnalysisJob, 1200);
-  }catch(err){
-    console.error(err);
-    analysisPollTimer = setTimeout(pollAnalysisJob, 2000);
-  }
-}
-
-function showBackendResults(r){
-  if(!r) return;
-  const frames = r.frames_processed || 0;
-  const total = r.total_vehicles || 0;
-  document.getElementById('resultMeta').textContent =
-    `Processed ${frames} sampled frames · ${r.unique_tracks || total} vehicle tracks · ${r.duration_seconds ? fmtDuration(r.duration_seconds)+' clip' : ''}`;
-  document.getElementById('resultGrid').innerHTML = `
-    <div class="result-chip"><div class="n">${total}</div><div class="l">Total Vehicles</div></div>
-    <div class="result-chip"><div class="n">${r.density}</div><div class="l">Density</div></div>
-    <div class="result-chip"><div class="n">${fmtDist(r.queue_length_m || 0)}</div><div class="l">Queue Length</div></div>
-    <div class="result-chip"><div class="n">${r.recommended_green_seconds}s</div><div class="l">Rec. Green Time</div></div>
-  `;
-  resultCard.classList.add('show');
-}
-
-let recentAnalyses = [];
-async function loadRecentAnalyses(){
-  try{
-    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/analyses?limit=6`);
-    if(!res.ok) return;
-    recentAnalyses = await res.json();
-    renderRecentAnalyses();
-  }catch(e){ console.warn(e); }
-}
-
-function renderRecentAnalyses(){
-  document.getElementById('recentCount').textContent = recentAnalyses.length + ' RECENT';
-  if(!recentAnalyses.length){
-    document.getElementById('recentAnalysesBody').innerHTML =
-      `<tr><td colspan="4" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No analyses yet — upload a video to get started.</td></tr>`;
-    return;
-  }
-  document.getElementById('recentAnalysesBody').innerHTML = recentAnalyses.map(r=>`
-    <tr>
-      <td><div class="jname" style="font-size:13px;">${escapeHtml(r.filename)}</div><div class="panel-tag">${new Date(r.created_at).toLocaleTimeString('en-GB')}</div></td>
-      <td class="jnum">${r.total_vehicles}</td>
-      <td><span class="densechip ${r.density}">${r.density}</span></td>
-      <td class="jnum">${r.recommended_green_seconds}s</td>
-    </tr>`).join('');
-}
-
-
-
-function showResults(){
-  const cars = 18+Math.round(Math.random()*30);
-  const bikes = 4+Math.round(Math.random()*15);
-  const buses = Math.round(Math.random()*5);
-  const trucks = Math.round(Math.random()*6);
-  const total = cars+bikes+buses+trucks;
-  const dens = densityFromTotal(total);
-  const rec = recGreenFromDensity(dens);
-  const queue = Math.round(total*1.05 + Math.random()*8);
-  const fps = 25;
-  const frames = currentDuration ? Math.round(currentDuration*fps) : 300+Math.round(Math.random()*400);
-
-  document.getElementById('resultMeta').textContent = `Processed ${frames} frames${currentDuration? ' · '+fmtDuration(currentDuration)+' clip':''} · ${total} vehicle tracks`;
-  document.getElementById('resultGrid').innerHTML = `
-    <div class="result-chip"><div class="n">${total}</div><div class="l">Total Vehicles</div></div>
-    <div class="result-chip"><div class="n">${dens}</div><div class="l">Density</div></div>
-    <div class="result-chip"><div class="n">${fmtDist(queue)}</div><div class="l">Queue Length</div></div>
-    <div class="result-chip"><div class="n">${rec}s</div><div class="l">Rec. Green Time</div></div>
-  `;
-  resultCard.classList.add('show');
-
-  recentAnalyses.unshift({name:currentFileName||'video.mp4', total, dens, rec, time:new Date().toLocaleTimeString('en-GB')});
-  recentAnalyses = recentAnalyses.slice(0,6);
-  renderRecentAnalyses();
-}
-
-function renderRecentAnalyses(){
-  document.getElementById('recentCount').textContent = recentAnalyses.length + ' THIS SESSION';
-  if(recentAnalyses.length===0){
-    document.getElementById('recentAnalysesBody').innerHTML = `<tr><td colspan="4" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No analyses yet — upload a video to get started.</td></tr>`;
-    return;
-  }
-  document.getElementById('recentAnalysesBody').innerHTML = recentAnalyses.map(r=>`
-    <tr>
-      <td><div class="jname" style="font-size:13px;">${r.name}</div><div class="panel-tag">${r.time}</div></td>
-      <td class="jnum">${r.total}</td>
-      <td><span class="densechip ${r.dens}">${r.dens}</span></td>
-      <td class="jnum">${r.rec}s</td>
-    </tr>`).join('');
-}
-
-dropZone.addEventListener('click', ()=> fileInput.click());
-fileInput.addEventListener('change', (e)=> handleFile(e.target.files[0]));
-['dragenter','dragover'].forEach(evt=> dropZone.addEventListener(evt, (e)=>{ e.preventDefault(); dropZone.classList.add('drag'); }));
-['dragleave','drop'].forEach(evt=> dropZone.addEventListener(evt, (e)=>{ e.preventDefault(); dropZone.classList.remove('drag'); }));
-dropZone.addEventListener('drop', (e)=>{ const f = e.dataTransfer.files[0]; if(f) handleFile(f); });
-document.getElementById('analyzeAnother').addEventListener('click', clearUpload);
-
-/* ---------------- settings interactions ---------------- */
-document.querySelectorAll('[data-toggle]').forEach(t=> t.addEventListener('click', ()=>{
-  t.classList.toggle('on');
-  if(t.id==='toggleCompact') document.body.classList.toggle('compact', t.classList.contains('on'));
-}));
-const thresholdSlider = document.getElementById('thresholdSlider');
-thresholdSlider.addEventListener('input', ()=>{
-  HIGH_THRESHOLD = parseInt(thresholdSlider.value, 10);
-  document.getElementById('thresholdVal').textContent = thresholdSlider.value;
+    const created=await api('/api/junctions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim()})});
+    await loadJunctions();
+    showToast('Junction added: '+created.name);
+  }catch(err){showToast('Could not add junction: '+err.message,true);}
 });
-document.querySelectorAll('.tswatch').forEach(sw=> sw.addEventListener('click', ()=>{
-  document.querySelectorAll('.tswatch').forEach(s=>s.classList.remove('active'));
-  sw.classList.add('active');
-  document.documentElement.setAttribute('data-theme', sw.dataset.theme);
-  showToast('Theme set to '+sw.dataset.theme);
-}));
 
-/* ---------------- TRAFIQ backend integration ---------------- */
-function escapeHtml(v){
-  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+/* ---------------- settings ---------------- */
+function syncSettingsUI(){
+  const map={high_density_alerts:'toggleHighDensity',emergency_priority:'toggleEmergency',camera_health_alerts:'toggleCameraHealth',weekly_analytics_email:'toggleWeeklyEmail'};
+  Object.entries(map).forEach(([key,id])=>$(id).classList.toggle('on',!!settings[key]));
+  $('thresholdSlider').value=settings.high_density_threshold;
+  $('thresholdVal').textContent=settings.high_density_threshold;
 }
-
-async function apiJson(path, options={}){
-  const res = await fetch(window.TRAFIQ_API_BASE + path, options);
-  if(!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
-function applyDashboardData(d){
-  if(!d) return;
-  const c = d.counts || {};
-  const total = d.total_vehicles ?? ((c.car||0)+(c.motorcycle||0)+(c.bus||0)+(c.truck||0));
-  const dens = d.density || densityFromTotal(total);
-  document.getElementById('mCars').textContent = c.car ?? 0;
-  document.getElementById('mBikes').textContent = c.motorcycle ?? 0;
-  document.getElementById('mBuses').textContent = c.bus ?? 0;
-  document.getElementById('mTrucks').textContent = c.truck ?? 0;
-  document.getElementById('totVeh').textContent = total;
-  document.getElementById('queueLen').textContent = fmtDist(Math.round(d.queue_length_m||0));
-  document.getElementById('queueVal').textContent = fmtDist(Math.round(d.queue_length_m||0));
-  document.getElementById('avgSpeed').textContent = fmtSpeed(Math.round(d.avg_speed_kmh||0));
-  document.getElementById('waitTime').textContent = Math.round(d.avg_wait_seconds||0)+'s';
-  document.getElementById('recTime').textContent = d.recommended_green_seconds ?? 0;
-  document.getElementById('heroDensityWord').textContent = dens;
-  document.getElementById('densityBadge').className = 'density-badge '+dens;
-  document.getElementById('densityBadge').innerHTML = '● '+dens+' DENSITY';
-  const hist = d.history || [];
-  if(hist.length){
-    volumeChart.data.labels = hist.map((_,i)=>(hist.length-i)+'m');
-    volumeChart.data.datasets[0].data = hist;
-    volumeChart.update('none');
-  }
-  mixChart.data.datasets[0].data = [c.car||0,c.motorcycle||0,c.bus||0,c.truck||0];
-  mixChart.update('none');
-  renderMixLegend();
-  if(d.emergency && d.emergency.detected){
-    document.getElementById('emgText').textContent =
-      `${d.emergency.type || 'Emergency vehicle'} detected — ${d.emergency.arm || 'approach'}. Priority green recommended.`;
-    document.getElementById('emgBanner').classList.add('show');
-  }
-}
-
-async function refreshDashboard(){
-  try{
-    const id = window.TRAFIQ_SELECTED_JUNCTION_ID || 'CAM-04';
-    const d = await apiJson(`/api/dashboard?junction_id=${encodeURIComponent(id)}`);
-    applyDashboardData(d);
-  }catch(e){ console.warn('Dashboard API:',e); }
-}
-
-async function loadJunctionsFromBackend(){
-  try{
-    const data = await apiJson('/api/junctions');
-    window.TRAFIQ_JUNCTIONS = data;
-    const filtered = searchTerm ? data.filter(j =>
-      j.name.toLowerCase().includes(searchTerm) || j.id.toLowerCase().includes(searchTerm)
-    ) : data;
-    document.getElementById('junctionCountTag').textContent = `${filtered.length} OF ${data.length} CONNECTED`;
-    document.getElementById('junctionRows').innerHTML = filtered.length ? filtered.map(j=>{
-      const d=j.latest || {};
-      const total=d.total_vehicles ?? 0;
-      const dens=d.density || 'LOW';
-      return `<tr style="cursor:pointer;" data-jname="${escapeHtml(j.name)}" data-jid="${escapeHtml(j.id)}">
-        <td><div class="jname">${escapeHtml(j.name)}</div><div class="panel-tag">${escapeHtml(j.id)}</div></td>
-        <td><span class="jstatus"><span class="dot ${j.online?'on':'warn'}"></span>${j.online?'Online':'Reconnecting'}</span></td>
-        <td class="jnum">${total}</td>
-        <td><span class="densechip ${dens}">${dens}</span></td>
-        <td class="jnum">${fmtDist(Math.round(d.queue_length_m||0))}</td>
-        <td class="jnum">${d.recommended_green_seconds ?? 0}s</td>
-      </tr>`;
-    }).join('') : `<tr><td colspan="6" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No junctions match "${escapeHtml(searchTerm)}".</td></tr>`;
-    document.querySelectorAll('#junctionRows tr[data-jname]').forEach(tr=>{
-      tr.addEventListener('click', ()=> {
-        window.TRAFIQ_SELECTED_JUNCTION_ID=tr.dataset.jid;
-        document.getElementById('heroJunctionName').innerHTML = escapeHtml(tr.dataset.jname).replace(/ /g,'&nbsp;');
-        document.getElementById('heroCamTag').textContent = tr.dataset.jid+' · '+tr.dataset.jname.toUpperCase()+' · LIVE BACKEND';
-        showView('dashboard'); refreshDashboard();
-      });
-    });
-  }catch(e){ console.warn('Junction API:',e); }
-}
-
-async function saveJunctionFromBackend(){
-  const name = prompt('New junction name');
-  if(!name) return;
-  try{
-    const j = await apiJson('/api/junctions', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name})
-    });
-    showToast('Junction added: '+j.name);
-    loadJunctionsFromBackend();
-  }catch(e){ showToast('Could not add junction'); }
-}
-
-/* Override the original Add Junction action in backend mode. */
-const oldAdd = document.getElementById('addJunctionBtn');
-if(oldAdd){
-  const clone = oldAdd.cloneNode(true);
-  oldAdd.replaceWith(clone);
-  clone.addEventListener('click', saveJunctionFromBackend);
-}
-
-/* Persist settings in the backend. */
 async function loadSettings(){
-  try{
-    const s = await apiJson('/api/settings');
-    HIGH_THRESHOLD = s.high_density_threshold ?? 50;
-    document.getElementById('thresholdSlider').value = HIGH_THRESHOLD;
-    document.getElementById('thresholdVal').textContent = HIGH_THRESHOLD;
-  }catch(e){}
+  try{ settings=await api('/api/settings'); syncSettingsUI(); }catch(err){showToast('Could not load settings: '+err.message,true);}
 }
 async function saveSettings(){
-  const body={
-    high_density_alerts:document.getElementById('toggleHighDensity').classList.contains('on'),
-    emergency_priority:document.getElementById('toggleEmergency').classList.contains('on'),
-    camera_health_alerts:document.getElementById('toggleCameraHealth').classList.contains('on'),
-    weekly_analytics_email:document.getElementById('toggleWeeklyEmail').classList.contains('on'),
-    high_density_threshold:Number(document.getElementById('thresholdSlider').value)
-  };
-  try{ await apiJson('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
+  try{
+    settings={
+      high_density_alerts:$('toggleHighDensity').classList.contains('on'),
+      emergency_priority:$('toggleEmergency').classList.contains('on'),
+      camera_health_alerts:$('toggleCameraHealth').classList.contains('on'),
+      weekly_analytics_email:$('toggleWeeklyEmail').classList.contains('on'),
+      high_density_threshold:Number($('thresholdSlider').value),
+    };
+    await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)});
+    showToast('Settings saved to backend.');
+  }catch(err){showToast('Could not save settings: '+err.message,true);}
 }
-document.querySelectorAll('[data-toggle]').forEach(t=>t.addEventListener('click',()=>setTimeout(saveSettings,0)));
-document.getElementById('thresholdSlider').addEventListener('change', saveSettings);
+document.querySelectorAll('[data-toggle]').forEach(t=>t.addEventListener('click',()=>{t.classList.toggle('on'); saveSettings();}));
+$('thresholdSlider').addEventListener('change',saveSettings);
+document.querySelectorAll('.tswatch').forEach(sw=>sw.addEventListener('click',()=>{
+  document.querySelectorAll('.tswatch').forEach(s=>s.classList.remove('active'));
+  sw.classList.add('active');
+  document.documentElement.setAttribute('data-theme',sw.dataset.theme);
+  localStorage.setItem('trafiq_theme',sw.dataset.theme);
+  showToast('Theme set to '+sw.dataset.theme+'.');
+}));
+const savedTheme=localStorage.getItem('trafiq_theme')||'light';
+document.documentElement.setAttribute('data-theme',savedTheme);
+document.querySelectorAll('.tswatch').forEach(s=>s.classList.toggle('active',s.dataset.theme===savedTheme));
 
-if(window.TRAFIQ_BACKEND_MODE){
-  loadSettings();
-  loadRecentAnalyses();
-  loadJunctionsFromBackend();
-  refreshDashboard();
-  setInterval(refreshDashboard, 4000);
-  setInterval(loadJunctionsFromBackend, 7000);
+$('toggleCompact').addEventListener('click',()=>document.body.classList.toggle('compact',$('toggleCompact').classList.contains('on')));
+
+/* ---------------- upload & REAL AI analysis ---------------- */
+const dropZone=$('dropZone'), fileInput=$('fileInput');
+function fmtBytes(b){if(b<1024)return b+' B';if(b<1024*1024)return(b/1024).toFixed(1)+' KB';return(b/(1024*1024)).toFixed(1)+' MB';}
+function fmtDuration(s){if(!isFinite(s))return'—';const m=Math.floor(s/60),r=Math.round(s%60);return m+':'+String(r).padStart(2,'0');}
+function clearUpload(){
+  if(analysisPollTimer) clearTimeout(analysisPollTimer);
+  $('fileRowHolder').innerHTML=''; $('progressWrap').classList.remove('show'); $('resultCard').classList.remove('show'); fileInput.value='';
+  if(currentObjectUrl){URL.revokeObjectURL(currentObjectUrl);currentObjectUrl=null;}
+}
+function handleFile(file){
+  if(!file)return;
+  const allowed=['video/mp4','video/avi','video/quicktime','video/x-matroska','video/webm'];
+  const ext=file.name.split('.').pop().toLowerCase();
+  if(!['mp4','avi','mov','mkv','webm'].includes(ext)){showToast('Unsupported video format.',true);return;}
+  currentFileName=file.name;
+  if(currentObjectUrl)URL.revokeObjectURL(currentObjectUrl);
+  currentObjectUrl=URL.createObjectURL(file);
+  $('fileRowHolder').innerHTML=`<div class="file-row"><div class="file-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="4" width="15" height="16" rx="2"/><path d="M22 8l-5 3.5L22 15V8z"/></svg></div><div class="file-meta"><div class="file-name">${escapeHtml(file.name)}</div><div class="file-size" id="fileSizeLine">${fmtBytes(file.size)} · ${escapeHtml(file.type||'video')}</div></div><div class="file-remove" id="fileRemoveBtn">✕</div></div><video id="videoPreview" src="${currentObjectUrl}" controls muted style="width:100%;border-radius:12px;margin-top:12px;background:#000;max-height:260px"></video>`;
+  $('videoPreview').addEventListener('loadedmetadata',()=>{currentDuration=$('videoPreview').duration||0;$('fileSizeLine').textContent=`${fmtBytes(file.size)} · ${file.type||'video'} · ${fmtDuration(currentDuration)}`;});
+  $('fileRemoveBtn').addEventListener('click',clearUpload);
+  runRealAnalysis(file);
+}
+async function runRealAnalysis(file){
+  $('progressWrap').classList.add('show');
+  $('resultCard').classList.remove('show');
+  const stages=['Uploading video','Queued for AI analysis','Running YOLO detection + tracking','Computing traffic intelligence','Generating signal recommendation'];
+  $('stageList').innerHTML=stages.map((s,i)=>`<div class="stage-item" data-i="${i}"><div class="si-dot"></div><span>${s}</span></div>`).join('');
+  $('progressFill').style.width='5%'; $('progressPct').textContent='5%'; $('progressStageLabel').textContent='Uploading video…';
+  const form=new FormData(); form.append('file',file); form.append('junction_id',selectedJunctionId);
+  try{
+    const queued=await api('/api/analyze',{method:'POST',body:form});
+    markStage(0);
+    await pollJob(queued.job_id);
+  }catch(err){
+    $('progressStageLabel').textContent='Analysis failed'; $('progressPct').textContent='0%'; $('progressFill').style.width='0%';
+    showToast('AI analysis failed: '+err.message,true);
+  }
+}
+function markStage(index){
+  document.querySelectorAll('.stage-item').forEach((el,i)=>{
+    el.classList.remove('active','done');
+    if(i<index)el.classList.add('done');
+    if(i===index)el.classList.add('active');
+  });
+}
+async function pollJob(jobId){
+  const job=await api('/api/jobs/'+encodeURIComponent(jobId));
+  $('progressFill').style.width=Math.max(5,job.progress||0)+'%'; $('progressPct').textContent=(job.progress||0)+'%'; $('progressStageLabel').textContent=(job.message||job.status)+'…';
+  if(job.status==='completed'){
+    document.querySelectorAll('.stage-item').forEach(el=>el.classList.add('done'));
+    showRealResults(job.result||{});
+    await loadRecentAnalyses();
+    await loadDashboard();
+    showToast('Real YOLO traffic analysis completed.');
+    return;
+  }
+  if(job.status==='failed'){throw new Error(job.error||'Backend analysis failed.');}
+  markStage(job.progress>60?2:job.progress>5?1:0);
+  analysisPollTimer=setTimeout(()=>pollJob(jobId).catch(err=>showToast(err.message,true)),1200);
+}
+function showRealResults(result){
+  const total=result.total_vehicles||0, dens=result.density||'LOW', queue=result.queue_length_m||0, rec=result.recommended_green_seconds||20;
+  $('resultMeta').textContent=`Processed ${result.frames_processed||0} frames · ${fmtDuration(result.duration_seconds||0)} clip · ${result.unique_tracks||0} unique tracks`;
+  $('resultGrid').innerHTML=`<div class="result-chip"><div class="n">${total}</div><div class="l">Total Vehicles</div></div><div class="result-chip"><div class="n">${dens}</div><div class="l">Density</div></div><div class="result-chip"><div class="n">${fmtDist(queue)}</div><div class="l">Queue Length</div></div><div class="result-chip"><div class="n">${rec}s</div><div class="l">Rec. Green Time</div></div>`;
+  $('resultCard').classList.add('show');
+}
+dropZone.addEventListener('click',()=>fileInput.click());
+fileInput.addEventListener('change',e=>handleFile(e.target.files[0]));
+['dragenter','dragover'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.add('drag');}));
+['dragleave','drop'].forEach(evt=>dropZone.addEventListener(evt,e=>{e.preventDefault();dropZone.classList.remove('drag');}));
+dropZone.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)handleFile(f);});
+$('analyzeAnother').addEventListener('click',clearUpload);
+
+/* ---------------- recent analyses ---------------- */
+async function loadRecentAnalyses(){
+  try{
+    const rows=await api('/api/analyses?limit=10&junction_id='+encodeURIComponent(selectedJunctionId));
+    $('recentCount').textContent=rows.length+' SAVED ANALYSES';
+    $('recentAnalysesBody').innerHTML=rows.length?rows.map(r=>`<tr><td><div class="jname" style="font-size:13px">${escapeHtml(r.filename)}</div><div class="panel-tag">${new Date(r.created_at).toLocaleString()}</div></td><td class="jnum">${r.total_vehicles}</td><td><span class="densechip ${r.density}">${r.density}</span></td><td class="jnum">${r.recommended_green_seconds}s</td></tr>`).join(''):'<tr><td colspan="4" style="color:var(--text-faint);font-family:var(--mono);font-size:12px">No saved analyses for this junction yet.</td></tr>';
+  }catch(err){$('recentAnalysesBody').innerHTML=`<tr><td colspan="4" style="color:var(--red);font-family:var(--mono);font-size:12px">Cannot load analysis history.</td></tr>`;}
 }
 
+/* ---------------- helpers ---------------- */
+function escapeHtml(value){return String(value??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+
+/* ---------------- startup + polling ---------------- */
+async function boot(){
+  initCharts();
+  syncSettingsUI();
+  try{
+    const health=await api('/api/health');
+    $('trackingStatus').textContent=health.yolo_available?'BACKEND ONLINE · YOLO READY':'BACKEND ONLINE · YOLO UNAVAILABLE';
+    $('trackingStatus').style.color='';
+  }catch(err){
+    $('trackingStatus').textContent='BACKEND OFFLINE';
+    $('trackingStatus').style.color='var(--red)';
+  }
+  await loadJunctions();
+  await loadSettings();
+  await loadDashboard();
+  await loadRecentAnalyses();
+  setInterval(loadDashboard,5000);
+  setInterval(loadJunctions,10000);
+}
+boot();
 </script>
 </body>
 </html>
