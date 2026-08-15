@@ -487,7 +487,7 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3v12m0-12l-4 4m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
           <div class="t1">Drop your video here, or click to browse</div>
           <div class="t2">MP4, AVI, MOV, MKV — up to 500MB</div>
-          <div class="t3">Nothing leaves your browser in this demo — analysis is simulated locally.</div>
+          <div class="t3">Video is uploaded securely to the TRAFIQ backend for real AI analysis.</div>
         </div>
         <input type="file" id="fileInput" accept="video/*" style="display:none;">
 
@@ -617,12 +617,23 @@ footer{border-top:1px solid var(--border);padding:28px 0;margin-top:10px;}
 <footer>
   <div class="foot-row">
     <span>TRAFIQ — AI Smart Traffic Management System</span>
-    <span>Prototype dashboard · values are simulated for demonstration</span>
+    <span>TRAFIQ control room · live backend analytics</span>
     <span id="footClock">—</span>
   </div>
 </footer>
 
 </div>
+
+
+<script>
+  // TRAFIQ backend connection. Change this when deploying the FastAPI server.
+  window.TRAFIQ_API_BASE = window.TRAFIQ_API_BASE || (
+    window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? 'http://127.0.0.1:8000'
+      : 'http://127.0.0.1:8000'
+  );
+  window.TRAFIQ_BACKEND_MODE = true;
+</script>
 
 <script>
 /* ---------------- navigation ---------------- */
@@ -830,6 +841,7 @@ renderMixLegend();
 function jitter(v,min,max,amt){ return Math.max(min, Math.min(max, v + Math.round((Math.random()-0.45)*amt))); }
 
 function updateMetrics(){
+  if(window.TRAFIQ_BACKEND_MODE) return;
   const prev = {...counts};
   counts.car = jitter(counts.car,10,60,6);
   counts.bike = jitter(counts.bike,2,25,4);
@@ -897,7 +909,7 @@ function setDelta(id, diff){
   else if(diff<0){ el.textContent='↓ '+Math.abs(diff)+' vs last min'; el.className='mcard-delta down'; }
   else { el.textContent='→ steady'; el.className='mcard-delta'; }
 }
-setInterval(updateMetrics, 4000);
+if(!window.TRAFIQ_BACKEND_MODE) setInterval(updateMetrics, 4000);
 
 /* ---------------- junction table ---------------- */
 const junctions = [
@@ -921,6 +933,7 @@ document.getElementById('addJunctionBtn').addEventListener('click', ()=>{
   showToast('Junction added: '+name);
 });
 function renderJunctions(){
+  if(window.TRAFIQ_BACKEND_MODE) return;
   const filtered = searchTerm ? junctions.filter(j=> j.name.toLowerCase().includes(searchTerm) || j.id.toLowerCase().includes(searchTerm)) : junctions;
   document.getElementById('junctionCountTag').textContent = filtered.length+' OF '+junctions.length+' CONNECTED';
   if(filtered.length===0){
@@ -950,7 +963,7 @@ function renderJunctions(){
     tr.addEventListener('click', ()=> selectJunction({name:tr.dataset.jname, id:tr.dataset.jid}));
   });
 }
-renderJunctions(); setInterval(renderJunctions, 5000);
+renderJunctions(); if(!window.TRAFIQ_BACKEND_MODE) setInterval(renderJunctions, 5000);
 
 /* ---------------- upload & analyze ---------------- */
 const dropZone = document.getElementById('dropZone');
@@ -1021,28 +1034,124 @@ function handleFile(file){
   runAnalysis();
 }
 
-function runAnalysis(){
+
+let analysisJobId = null;
+let analysisPollTimer = null;
+
+async function runAnalysis(){
+  if(!currentFileName) return;
   progressWrap.classList.add('show');
+  resultCard.classList.remove('show');
   stageList.innerHTML = stages.map((s,i)=>`<div class="stage-item" data-i="${i}"><div class="si-dot"></div><span>${s.label}</span></div>`).join('');
-  let i=0;
-  function nextStage(){
-    if(i>0){ document.querySelector(`.stage-item[data-i="${i-1}"]`).classList.replace('active','done'); }
-    if(i>=stages.length){
-      showResults();
+  progressStageLabel.textContent = 'Uploading video…';
+  progressPct.textContent = '5%';
+  progressFill.style.width = '5%';
+
+  const file = fileInput.files[0];
+  if(!file){
+    showToast('Please select a video first');
+    return;
+  }
+
+  try{
+    const form = new FormData();
+    form.append('file', file);
+    form.append('junction_id', window.TRAFIQ_SELECTED_JUNCTION_ID || 'CAM-04');
+
+    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/analyze`, {
+      method:'POST', body:form
+    });
+    if(!res.ok) throw new Error(await res.text());
+    const job = await res.json();
+    analysisJobId = job.job_id;
+    pollAnalysisJob();
+  }catch(err){
+    console.error(err);
+    progressStageLabel.textContent = 'Backend connection failed';
+    progressPct.textContent = '0%';
+    showToast('Could not connect to TRAFIQ backend');
+  }
+}
+
+async function pollAnalysisJob(){
+  if(!analysisJobId) return;
+  try{
+    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/jobs/${analysisJobId}`);
+    if(!res.ok) throw new Error(await res.text());
+    const job = await res.json();
+    const pct = Number(job.progress || 0);
+    progressPct.textContent = pct + '%';
+    progressFill.style.width = pct + '%';
+    progressStageLabel.textContent = job.message || job.status;
+
+    const active = Math.min(stages.length-1, Math.floor(pct/100*stages.length));
+    document.querySelectorAll('.stage-item').forEach((el,i)=>{
+      el.classList.toggle('done', i < active || job.status === 'completed');
+      el.classList.toggle('active', i === active && job.status !== 'completed' && job.status !== 'failed');
+    });
+
+    if(job.status === 'completed'){
+      if(analysisPollTimer) clearTimeout(analysisPollTimer);
+      showBackendResults(job.result);
+      loadRecentAnalyses();
+      await refreshDashboard();
       return;
     }
-    const item = document.querySelector(`.stage-item[data-i="${i}"]`);
-    item.classList.add('active');
-    progressStageLabel.textContent = stages[i].label + '…';
-    progressPct.textContent = stages[i].pct + '%';
-    progressFill.style.width = stages[i].pct + '%';
-    i++;
-    setTimeout(nextStage, 700 + Math.random()*500);
+    if(job.status === 'failed'){
+      if(analysisPollTimer) clearTimeout(analysisPollTimer);
+      progressStageLabel.textContent = 'Analysis failed';
+      showToast(job.error || 'Analysis failed');
+      return;
+    }
+    analysisPollTimer = setTimeout(pollAnalysisJob, 1200);
+  }catch(err){
+    console.error(err);
+    analysisPollTimer = setTimeout(pollAnalysisJob, 2000);
   }
-  nextStage();
+}
+
+function showBackendResults(r){
+  if(!r) return;
+  const frames = r.frames_processed || 0;
+  const total = r.total_vehicles || 0;
+  document.getElementById('resultMeta').textContent =
+    `Processed ${frames} sampled frames · ${r.unique_tracks || total} vehicle tracks · ${r.duration_seconds ? fmtDuration(r.duration_seconds)+' clip' : ''}`;
+  document.getElementById('resultGrid').innerHTML = `
+    <div class="result-chip"><div class="n">${total}</div><div class="l">Total Vehicles</div></div>
+    <div class="result-chip"><div class="n">${r.density}</div><div class="l">Density</div></div>
+    <div class="result-chip"><div class="n">${fmtDist(r.queue_length_m || 0)}</div><div class="l">Queue Length</div></div>
+    <div class="result-chip"><div class="n">${r.recommended_green_seconds}s</div><div class="l">Rec. Green Time</div></div>
+  `;
+  resultCard.classList.add('show');
 }
 
 let recentAnalyses = [];
+async function loadRecentAnalyses(){
+  try{
+    const res = await fetch(`${window.TRAFIQ_API_BASE}/api/analyses?limit=6`);
+    if(!res.ok) return;
+    recentAnalyses = await res.json();
+    renderRecentAnalyses();
+  }catch(e){ console.warn(e); }
+}
+
+function renderRecentAnalyses(){
+  document.getElementById('recentCount').textContent = recentAnalyses.length + ' RECENT';
+  if(!recentAnalyses.length){
+    document.getElementById('recentAnalysesBody').innerHTML =
+      `<tr><td colspan="4" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No analyses yet — upload a video to get started.</td></tr>`;
+    return;
+  }
+  document.getElementById('recentAnalysesBody').innerHTML = recentAnalyses.map(r=>`
+    <tr>
+      <td><div class="jname" style="font-size:13px;">${escapeHtml(r.filename)}</div><div class="panel-tag">${new Date(r.created_at).toLocaleTimeString('en-GB')}</div></td>
+      <td class="jnum">${r.total_vehicles}</td>
+      <td><span class="densechip ${r.density}">${r.density}</span></td>
+      <td class="jnum">${r.recommended_green_seconds}s</td>
+    </tr>`).join('');
+}
+
+
 
 function showResults(){
   const cars = 18+Math.round(Math.random()*30);
@@ -1108,6 +1217,145 @@ document.querySelectorAll('.tswatch').forEach(sw=> sw.addEventListener('click', 
   document.documentElement.setAttribute('data-theme', sw.dataset.theme);
   showToast('Theme set to '+sw.dataset.theme);
 }));
+
+/* ---------------- TRAFIQ backend integration ---------------- */
+function escapeHtml(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+}
+
+async function apiJson(path, options={}){
+  const res = await fetch(window.TRAFIQ_API_BASE + path, options);
+  if(!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function applyDashboardData(d){
+  if(!d) return;
+  const c = d.counts || {};
+  const total = d.total_vehicles ?? ((c.car||0)+(c.motorcycle||0)+(c.bus||0)+(c.truck||0));
+  const dens = d.density || densityFromTotal(total);
+  document.getElementById('mCars').textContent = c.car ?? 0;
+  document.getElementById('mBikes').textContent = c.motorcycle ?? 0;
+  document.getElementById('mBuses').textContent = c.bus ?? 0;
+  document.getElementById('mTrucks').textContent = c.truck ?? 0;
+  document.getElementById('totVeh').textContent = total;
+  document.getElementById('queueLen').textContent = fmtDist(Math.round(d.queue_length_m||0));
+  document.getElementById('queueVal').textContent = fmtDist(Math.round(d.queue_length_m||0));
+  document.getElementById('avgSpeed').textContent = fmtSpeed(Math.round(d.avg_speed_kmh||0));
+  document.getElementById('waitTime').textContent = Math.round(d.avg_wait_seconds||0)+'s';
+  document.getElementById('recTime').textContent = d.recommended_green_seconds ?? 0;
+  document.getElementById('heroDensityWord').textContent = dens;
+  document.getElementById('densityBadge').className = 'density-badge '+dens;
+  document.getElementById('densityBadge').innerHTML = '● '+dens+' DENSITY';
+  const hist = d.history || [];
+  if(hist.length){
+    volumeChart.data.labels = hist.map((_,i)=>(hist.length-i)+'m');
+    volumeChart.data.datasets[0].data = hist;
+    volumeChart.update('none');
+  }
+  mixChart.data.datasets[0].data = [c.car||0,c.motorcycle||0,c.bus||0,c.truck||0];
+  mixChart.update('none');
+  renderMixLegend();
+  if(d.emergency && d.emergency.detected){
+    document.getElementById('emgText').textContent =
+      `${d.emergency.type || 'Emergency vehicle'} detected — ${d.emergency.arm || 'approach'}. Priority green recommended.`;
+    document.getElementById('emgBanner').classList.add('show');
+  }
+}
+
+async function refreshDashboard(){
+  try{
+    const id = window.TRAFIQ_SELECTED_JUNCTION_ID || 'CAM-04';
+    const d = await apiJson(`/api/dashboard?junction_id=${encodeURIComponent(id)}`);
+    applyDashboardData(d);
+  }catch(e){ console.warn('Dashboard API:',e); }
+}
+
+async function loadJunctionsFromBackend(){
+  try{
+    const data = await apiJson('/api/junctions');
+    window.TRAFIQ_JUNCTIONS = data;
+    const filtered = searchTerm ? data.filter(j =>
+      j.name.toLowerCase().includes(searchTerm) || j.id.toLowerCase().includes(searchTerm)
+    ) : data;
+    document.getElementById('junctionCountTag').textContent = `${filtered.length} OF ${data.length} CONNECTED`;
+    document.getElementById('junctionRows').innerHTML = filtered.length ? filtered.map(j=>{
+      const d=j.latest || {};
+      const total=d.total_vehicles ?? 0;
+      const dens=d.density || 'LOW';
+      return `<tr style="cursor:pointer;" data-jname="${escapeHtml(j.name)}" data-jid="${escapeHtml(j.id)}">
+        <td><div class="jname">${escapeHtml(j.name)}</div><div class="panel-tag">${escapeHtml(j.id)}</div></td>
+        <td><span class="jstatus"><span class="dot ${j.online?'on':'warn'}"></span>${j.online?'Online':'Reconnecting'}</span></td>
+        <td class="jnum">${total}</td>
+        <td><span class="densechip ${dens}">${dens}</span></td>
+        <td class="jnum">${fmtDist(Math.round(d.queue_length_m||0))}</td>
+        <td class="jnum">${d.recommended_green_seconds ?? 0}s</td>
+      </tr>`;
+    }).join('') : `<tr><td colspan="6" style="color:var(--text-faint);font-family:var(--mono);font-size:12px;">No junctions match "${escapeHtml(searchTerm)}".</td></tr>`;
+    document.querySelectorAll('#junctionRows tr[data-jname]').forEach(tr=>{
+      tr.addEventListener('click', ()=> {
+        window.TRAFIQ_SELECTED_JUNCTION_ID=tr.dataset.jid;
+        document.getElementById('heroJunctionName').innerHTML = escapeHtml(tr.dataset.jname).replace(/ /g,'&nbsp;');
+        document.getElementById('heroCamTag').textContent = tr.dataset.jid+' · '+tr.dataset.jname.toUpperCase()+' · LIVE BACKEND';
+        showView('dashboard'); refreshDashboard();
+      });
+    });
+  }catch(e){ console.warn('Junction API:',e); }
+}
+
+async function saveJunctionFromBackend(){
+  const name = prompt('New junction name');
+  if(!name) return;
+  try{
+    const j = await apiJson('/api/junctions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name})
+    });
+    showToast('Junction added: '+j.name);
+    loadJunctionsFromBackend();
+  }catch(e){ showToast('Could not add junction'); }
+}
+
+/* Override the original Add Junction action in backend mode. */
+const oldAdd = document.getElementById('addJunctionBtn');
+if(oldAdd){
+  const clone = oldAdd.cloneNode(true);
+  oldAdd.replaceWith(clone);
+  clone.addEventListener('click', saveJunctionFromBackend);
+}
+
+/* Persist settings in the backend. */
+async function loadSettings(){
+  try{
+    const s = await apiJson('/api/settings');
+    HIGH_THRESHOLD = s.high_density_threshold ?? 50;
+    document.getElementById('thresholdSlider').value = HIGH_THRESHOLD;
+    document.getElementById('thresholdVal').textContent = HIGH_THRESHOLD;
+  }catch(e){}
+}
+async function saveSettings(){
+  const body={
+    high_density_alerts:document.getElementById('toggleHighDensity').classList.contains('on'),
+    emergency_priority:document.getElementById('toggleEmergency').classList.contains('on'),
+    camera_health_alerts:document.getElementById('toggleCameraHealth').classList.contains('on'),
+    weekly_analytics_email:document.getElementById('toggleWeeklyEmail').classList.contains('on'),
+    high_density_threshold:Number(document.getElementById('thresholdSlider').value)
+  };
+  try{ await apiJson('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
+}
+document.querySelectorAll('[data-toggle]').forEach(t=>t.addEventListener('click',()=>setTimeout(saveSettings,0)));
+document.getElementById('thresholdSlider').addEventListener('change', saveSettings);
+
+if(window.TRAFIQ_BACKEND_MODE){
+  loadSettings();
+  loadRecentAnalyses();
+  loadJunctionsFromBackend();
+  refreshDashboard();
+  setInterval(refreshDashboard, 4000);
+  setInterval(loadJunctionsFromBackend, 7000);
+}
+
 </script>
 </body>
 </html>
