@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from transportation_management import generate_transportation_decision
 
 import cv2
 import numpy as np
@@ -227,18 +228,26 @@ def make_result(
     threshold: int,
 ) -> dict[str, Any]:
     total = sum(latest_counts.values())
-    density = classify_density(total, threshold)
+    transport_decision = generate_transportation_decision(
+    counts=latest_counts,
+    queue_length_m=queue_length_m,
+    avg_speed_kmh=avg_speed_kmh,
+    avg_wait_seconds=avg_wait_seconds,
+    threshold=threshold,
+)
     return {
         "frames_processed": frames_processed,
         "duration_seconds": round(duration_seconds, 2),
         "total_vehicles": total,
         "unique_tracks": unique_tracks,
         "counts": latest_counts,
-        "density": density,
+       "density": transport_decision["density"],
         "queue_length_m": round(queue_length_m, 1),
         "avg_speed_kmh": round(avg_speed_kmh, 1),
         "avg_wait_seconds": round(avg_wait_seconds, 1),
-        "recommended_green_seconds": recommended_green(density, total),
+       "recommended_green_seconds": transport_decision["recommended_green_seconds"],
+        "decision": transport_decision["decision"],
+         "reason": transport_decision["reason"],
         "emergency": {"detected": False, "type": None, "arm": None},
     }
 
